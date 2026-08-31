@@ -18,9 +18,12 @@ final class MailketingApiTransportFactory extends AbstractTransportFactory
             throw new UnsupportedSchemeException($dsn, 'mailketing', $this->getSupportedSchemes());
         }
 
-        $apiToken = $dsn->getPassword() ?: $dsn->getUser();
+        // Symfony Mailer convention places an API key in the DSN user field,
+        // but accepting the password field keeps upgrades from older plugin
+        // configurations working.
+        $apiToken = $dsn->getUser() ?: $dsn->getPassword();
         if (null === $apiToken || '' === $apiToken) {
-            throw new InvalidArgumentException('Mailketing API token is missing from the DSN password field.');
+            throw new InvalidArgumentException('Mailketing API token is missing from the DSN user or password field.');
         }
 
         return new MailketingApiTransport(

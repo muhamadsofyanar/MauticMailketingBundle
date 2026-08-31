@@ -4,9 +4,6 @@ declare(strict_types=1);
 
 namespace MauticPlugin\MauticMailketingBundle\Mailer\Transport;
 
-use Mautic\EmailBundle\Mailer\Message\MauticMessage;
-use Mautic\EmailBundle\Mailer\Transport\TokenTransportInterface;
-use Mautic\EmailBundle\Mailer\Transport\TokenTransportTrait;
 use Psr\EventDispatcher\EventDispatcherInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Mailer\Envelope;
@@ -18,10 +15,17 @@ use Symfony\Component\Mime\Email;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 use Symfony\Contracts\HttpClient\ResponseInterface;
 
-final class MailketingApiTransport extends AbstractApiTransport implements TokenTransportInterface
+/**
+ * Mailketing API v2 transport for Mautic 5 / Symfony Mailer.
+ *
+ * This transport intentionally does not implement Mautic's
+ * TokenTransportInterface. That interface is reserved for providers that can
+ * perform per-recipient token replacement inside a batch request. Mailketing's
+ * /send endpoint accepts one recipient per request, so Mautic must render and
+ * send each contact's message separately to preserve personalization.
+ */
+final class MailketingApiTransport extends AbstractApiTransport
 {
-    use TokenTransportTrait;
-
     public const SCHEME = 'mailketing+api';
     public const API_URL = 'https://api.mailketing.co.id/api/v2/send';
 
@@ -39,43 +43,9 @@ final class MailketingApiTransport extends AbstractApiTransport implements Token
         return self::SCHEME.'://default';
     }
 
-    /**
-     * Mautic campaigns keep recipient metadata on MauticMessage. The regular
-     * Symfony Email recipients are still used for test and direct messages.
-     *
-     * @return list<Address>
-     */
-    private function getMailketingRecipients(SentMessage $sentMessage, Email $email): array
-    {
-        $recipients = array_merge($email->getTo(), $email->getCc(), $email->getBcc());
-        $original = $sentMessage->getOriginalMessage();
-        if ($original instanceof MauticMessage) {
-            foreach ($original->getMetadata() as $address => $metadata) {
-                if (!is_string($address) || !filter_var($address, FILTER_VALIDATE_EMAIL)) {
-                    continue;
-                }
-
-                $name = is_array($metadata) && is_string($metadata['name'] ?? null)
-                    ? $metadata['name']
-                    : '';
-                $recipients[] = new Address($address, $name);
-            }
-        }
-
-        $unique = [];
-        foreach ($recipients as $recipient) {
-            if (!$recipient instanceof Address) {
-                continue;
-            }
-            $unique[strtolower($recipient->getAddress())] = $recipient;
-        }
-
-        return array_values($unique);
-    }
-
     protected function doSendApi(SentMessage $sentMessage, Email $email, Envelope $envelope): ResponseInterface
     {
-        $recipients = $this->getMailketingRecipients($sentMessage, $email);
+        $recipients = $this->getUniqueRecipients($envelope);
         if ([] === $recipients) {
             throw new TransportException('Mailketing requires at least one recipient.');
         }
@@ -85,24 +55,31 @@ final class MailketingApiTransport extends AbstractApiTransport implements Token
             throw new TransportException('Mailketing requires a sender address.');
         }
 
-        $html = $email->getHtmlBody();
-        $text = $email->getTextBody();
-        $content = $html ?: $text;
+        $subject = trim((string) $email->getSubject());
+        if ('' === $subject) {
+            throw new TransportException('Mailketing requires an email subject.');
+        }
+
+        $html    = $email->getHtmlBody();
+        $text    = $email->getTextBody();
+        $content = null !== $html && '' !== trim($html) ? $html : $text;
         if (null === $content || '' === trim($content)) {
             throw new TransportException('Mailketing requires email content.');
         }
 
+        if ([] !== $email->getAttachments()) {
+            throw new TransportException(
+                'Mailketing API v2 accepts attachments only as public URLs; local Mautic attachments cannot be sent safely.'
+            );
+        }
+
         $lastResponse = null;
         foreach ($recipients as $recipient) {
-            if (!$recipient instanceof Address) {
-                continue;
-            }
-
             $payload = [
                 'from_name'  => $from->getName() ?: $from->getAddress(),
                 'from_email' => $from->getAddress(),
                 'recipient'  => $recipient->getAddress(),
-                'subject'    => $email->getSubject(),
+                'subject'    => $subject,
                 'content'    => $content,
             ];
 
@@ -120,13 +97,59 @@ final class MailketingApiTransport extends AbstractApiTransport implements Token
             ]);
 
             $statusCode = $lastResponse->getStatusCode();
-            $response = $lastResponse->toArray(false);
+            $rawBody    = $lastResponse->getContent(false);
+            $response   = json_decode($rawBody, true);
+            $response   = is_array($response) ? $response : [];
+
             if ($statusCode < 200 || $statusCode >= 300 || true !== ($response['success'] ?? false)) {
-                $message = (string) ($response['message'] ?? 'Unknown Mailketing API error.');
+                $message = $this->getApiErrorMessage($response, $rawBody);
                 throw new TransportException(sprintf('Mailketing API rejected the message (%d): %s', $statusCode, $message));
             }
         }
 
+        if (!$lastResponse instanceof ResponseInterface) {
+            throw new TransportException('Mailketing did not return a response.');
+        }
+
         return $lastResponse;
+    }
+
+    /**
+     * @return list<Address>
+     */
+    private function getUniqueRecipients(Envelope $envelope): array
+    {
+        $unique = [];
+        foreach ($envelope->getRecipients() as $recipient) {
+            $unique[strtolower($recipient->getAddress())] = $recipient;
+        }
+
+        return array_values($unique);
+    }
+
+    /**
+     * @param array<string, mixed> $response
+     */
+    private function getApiErrorMessage(array $response, string $rawBody): string
+    {
+        $message = $response['message'] ?? null;
+        if (is_string($message) && '' !== trim($message)) {
+            return trim($message);
+        }
+
+        $errors = $response['errors'] ?? null;
+        if (is_array($errors) && [] !== $errors) {
+            $encoded = json_encode($errors, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if (is_string($encoded)) {
+                return $encoded;
+            }
+        }
+
+        $plainBody = trim(strip_tags($rawBody));
+        if ('' !== $plainBody) {
+            return substr($plainBody, 0, 500);
+        }
+
+        return 'Unknown Mailketing API error.';
     }
 }
