@@ -45,7 +45,7 @@ final class MailketingApiTransport extends AbstractApiTransport implements Token
      *
      * @return list<Address>
      */
-    private function getRecipients(SentMessage $sentMessage, Email $email): array
+    private function getMailketingRecipients(SentMessage $sentMessage, Email $email): array
     {
         $recipients = array_merge($email->getTo(), $email->getCc(), $email->getBcc());
         $original = $sentMessage->getOriginalMessage();
@@ -75,7 +75,7 @@ final class MailketingApiTransport extends AbstractApiTransport implements Token
 
     protected function doSendApi(SentMessage $sentMessage, Email $email, Envelope $envelope): ResponseInterface
     {
-        $recipients = $this->getRecipients($sentMessage, $email);
+        $recipients = $this->getMailketingRecipients($sentMessage, $email);
         if ([] === $recipients) {
             throw new TransportException('Mailketing requires at least one recipient.');
         }
